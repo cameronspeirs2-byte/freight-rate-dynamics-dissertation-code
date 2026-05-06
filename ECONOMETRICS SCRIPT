@@ -1,0 +1,976 @@
+# ============================================================
+# DISSERTATION ECONOMETRICS SCRIPT
+# Freight Rates, Congestion, Demand, Weather, Trade War, Oil
+# Period: 2017-01-01 to 2019-12-31
+# ============================================================
+
+# ============================================================
+# 0. PACKAGES
+# ============================================================
+
+library(tidyverse)
+library(lubridate)
+library(readr)
+library(forecast)
+library(tseries)
+library(urca)
+library(moments)
+library(corrplot)
+library(lmtest)
+library(sandwich)
+library(car)
+library(zoo)
+library(broom)
+# ============================================================
+# 1. GLOBAL SETTINGS
+# ============================================================
+
+start_date <- as.Date("2017-01-01")
+end_date   <- as.Date("2019-12-31")
+
+# ============================================================
+# 2. HELPER FUNCTIONS
+# ============================================================
+
+safe_numeric <- function(x) {
+  as.numeric(gsub(",", "", x))
+}
+
+run_stationarity_tests <- function(series, series_name) {
+  x <- na.omit(series)
+  tibble(
+    variable = series_name,
+    adf_p_value = tryCatch(adf.test(x)$p.value, error = function(e) NA_real_),
+    kpss_p_value = tryCatch(kpss.test(x)$p.value, error = function(e) NA_real_)
+  )
+}
+
+nw_coeftest <- function(model, lag = 3) {
+  coeftest(model, vcov = NeweyWest(model, lag = lag, prewhite = FALSE))
+}
+
+extract_model_stats <- function(fitted_model, model_name) {
+  model_summary <- summary(fitted_model)
+  
+  tibble(
+    model = model_name,
+    r2 = model_summary$r.squared,
+    adj_r2 = model_summary$adj.r.squared,
+    aic = AIC(fitted_model),
+    bic = BIC(fitted_model),
+    n = length(residuals(fitted_model))
+  )
+}
+
+# ============================================================
+# 3. IMPORT RAW DATA
+# ============================================================
+
+freight    <- read_csv("freight_daily.csv", show_col_types = FALSE)
+ais        <- read_csv("daily_data.csv", show_col_types = FALSE)
+weather    <- read_csv("weather_daily_route.csv", show_col_types = FALSE)
+pmi        <- read_csv("PMI.csv", show_col_types = FALSE)
+industrial <- read_csv("Industrial Production.csv", show_col_types = FALSE)
+exchange   <- read_csv("DTWEXBGS.csv", show_col_types = FALSE)
+tariff     <- read_csv("tariff_daily_filled_2017_2019.csv", show_col_types = FALSE)
+oil_raw    <- read_csv("crude_oil_price.csv", show_col_types = FALSE)
+
+# ============================================================
+# 4. CLEAN AND STANDARDISE DATASETS
+# ============================================================
+
+# ----------------------------
+# 4.1 Freight
+# ----------------------------
+freight <- freight %>%
+  mutate(date = as_date(Date)) %>%
+  transmute(
+    date,
+    freight_rate = safe_numeric(XSICFEUW)
+  ) %>%
+  filter(date >= start_date, date <= end_date)
+
+# ----------------------------
+# 4.2 AIS
+# ----------------------------
+ais <- ais %>%
+  mutate(date = as_date(date)) %>%
+  filter(date >= start_date, date <= end_date)
+
+# ----------------------------
+# 4.3 Weather
+# ----------------------------
+weather <- weather %>%
+  mutate(date = as_date(date)) %>%
+  filter(date >= start_date, date <= end_date)
+
+# ----------------------------
+# 4.4 PMI
+# ----------------------------
+pmi <- pmi %>%
+  filter(...3 != "Date") %>%
+  transmute(
+    date = my(...3),
+    pmi = safe_numeric(...4)
+  ) %>%
+  filter(date >= start_date, date <= end_date)
+
+# ----------------------------
+# 4.5 Industrial production
+# ----------------------------
+industrial <- industrial %>%
+  transmute(
+    date = ym(date),
+    industrial_production = safe_numeric(industrial_production)
+  ) %>%
+  filter(date >= start_date, date <= end_date)
+
+# ----------------------------
+# 4.6 USD index
+# ----------------------------
+exchange <- exchange %>%
+  transmute(
+    date = as_date(observation_date),
+    usd_index = safe_numeric(DTWEXBGS)
+  ) %>%
+  filter(date >= start_date, date <= end_date)
+
+# ----------------------------
+# 4.7 Tariff data
+# ----------------------------
+tariff <- tariff %>%
+  mutate(date = as_date(date)) %>%
+  arrange(date) %>%
+  mutate(
+    trade_war = if_else(tariff_rate > 0, 1, 0)
+  ) %>%
+  filter(date >= start_date, date <= end_date)
+
+# ----------------------------
+# 4.8 Crude oil price
+# ----------------------------
+oil <- oil_raw %>%
+  transmute(
+    date = as_date(observation_date),
+    crude_oil_price = safe_numeric(DCOILBRENTEU)
+  ) %>%
+  filter(date >= start_date, date <= end_date) %>%
+  arrange(date)
+
+# ============================================================
+# 5. CONVERT TO MONTHLY DATA
+# ============================================================
+
+# ----------------------------
+# 5.1 Freight monthly
+# ----------------------------
+freight_monthly <- freight %>%
+  mutate(month = floor_date(date, "month")) %>%
+  group_by(month) %>%
+  summarise(
+    freight_rate = mean(freight_rate, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ----------------------------
+# 5.2 AIS monthly
+# ----------------------------
+ais_monthly <- ais %>%
+  mutate(month = floor_date(date, "month")) %>%
+  group_by(month) %>%
+  summarise(
+    across(where(is.numeric), ~ mean(.x, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+# ----------------------------
+# 5.3 Weather monthly
+# ----------------------------
+weather_monthly <- weather %>%
+  mutate(month = floor_date(date, "month")) %>%
+  group_by(month) %>%
+  summarise(
+    across(where(is.numeric), ~ mean(.x, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+# ----------------------------
+# 5.4 Oil monthly
+# ----------------------------
+oil_monthly <- oil %>%
+  mutate(month = floor_date(date, "month")) %>%
+  group_by(month) %>%
+  summarise(
+    crude_oil_price = mean(crude_oil_price, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ----------------------------
+# 5.5 Tariff monthly
+# ----------------------------
+tariff_monthly <- tariff %>%
+  mutate(month = floor_date(date, "month")) %>%
+  group_by(month) %>%
+  summarise(
+    tariff_rate = mean(tariff_rate, na.rm = TRUE),
+    goods_tariffed_pct = mean(goods_tariffed_pct, na.rm = TRUE),
+    trade_war = max(trade_war, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ----------------------------
+# 5.6 Already monthly series
+# ----------------------------
+pmi_monthly <- pmi %>%
+  mutate(month = floor_date(date, "month")) %>%
+  dplyr::select(month, pmi)
+
+industrial_monthly <- industrial %>%
+  mutate(month = floor_date(date, "month")) %>%
+  dplyr::select(month, industrial_production)
+
+exchange_monthly <- exchange %>%
+  mutate(month = floor_date(date, "month")) %>%
+  group_by(month) %>%
+  summarise(
+    usd_index = mean(usd_index, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ============================================================
+# 6. MERGE MONTHLY MASTER DATASET
+# ============================================================
+
+monthly_data <- freight_monthly %>%
+  left_join(ais_monthly, by = "month") %>%
+  left_join(weather_monthly, by = "month") %>%
+  left_join(pmi_monthly, by = "month") %>%
+  left_join(industrial_monthly, by = "month") %>%
+  left_join(exchange_monthly, by = "month") %>%
+  left_join(tariff_monthly, by = "month") %>%
+  left_join(oil_monthly, by = "month") %>%
+  arrange(month)
+
+# ============================================================
+# 7. INITIAL DATA CHECKS
+# ============================================================
+
+glimpse(monthly_data)
+summary(monthly_data)
+colSums(is.na(monthly_data))
+
+write_csv(monthly_data, "monthly_data_raw_merged.csv")
+
+# ============================================================
+# 8. VARIABLE CONSTRUCTION FOR ECONOMETRICS
+# ============================================================
+
+monthly_data <- monthly_data %>%
+  arrange(month) %>%
+  mutate(
+    log_freight = log(freight_rate),
+    log_industrial = log(industrial_production),
+    log_usd = log(usd_index),
+    log_oil = log(crude_oil_price),
+    
+    d_log_freight = log_freight - lag(log_freight),
+    d_log_industrial = log_industrial - lag(log_industrial),
+    d_log_usd = log_usd - lag(log_usd),
+    d_log_oil = log_oil - lag(log_oil),
+    
+    lag_d_log_freight = lag(d_log_freight, 1)
+  )
+
+# ============================================================
+# 9. DESCRIPTIVE STATISTICS
+# ============================================================
+
+descriptive_stats <- monthly_data %>%
+  summarise(
+    across(
+      where(is.numeric),
+      list(
+        mean = ~ mean(.x, na.rm = TRUE),
+        median = ~ median(.x, na.rm = TRUE),
+        sd = ~ sd(.x, na.rm = TRUE),
+        min = ~ min(.x, na.rm = TRUE),
+        max = ~ max(.x, na.rm = TRUE),
+        skew = ~ skewness(.x, na.rm = TRUE),
+        kurt = ~ kurtosis(.x, na.rm = TRUE)
+      )
+    )
+  )
+
+descriptive_stats
+write_csv(descriptive_stats, "descriptive_statistics.csv")
+
+# ============================================================
+# 10. PLOTS
+# ============================================================
+
+# Freight level
+ggplot(monthly_data, aes(x = month, y = freight_rate)) +
+  geom_line() +
+  theme_minimal() +
+  labs(
+    title = "Monthly Freight Rate",
+    x = "Month",
+    y = "Freight Rate"
+  )
+
+# Freight growth
+ggplot(monthly_data, aes(x = month, y = d_log_freight)) +
+  geom_line() +
+  theme_minimal() +
+  labs(
+    title = "Monthly Change in Log Freight Rate",
+    x = "Month",
+    y = "d_log_freight"
+  )
+
+# Main variables panel
+monthly_data %>%
+  dplyr::select(
+    month,
+    freight_rate,
+    d_log_freight,
+    daily_delay_rate,
+    weather_stress_index,
+    trade_war,
+    industrial_production,
+    pmi,
+    crude_oil_price
+  ) %>%
+  pivot_longer(-month, names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = month, y = value)) +
+  geom_line() +
+  facet_wrap(~ variable, scales = "free_y") +
+  theme_minimal() +
+  labs(
+    title = "Main Monthly Variables",
+    x = "Month",
+    y = NULL
+  )
+
+# ============================================================
+# 11. CORRELATION MATRIX
+# ============================================================
+
+correlation_data <- monthly_data %>%
+  dplyr::select(
+    freight_rate,
+    d_log_freight,
+    daily_active_ships,
+    daily_port_arrivals,
+    daily_delay_rate,
+    daily_avg_turnaround_hours,
+    weather_stress_index,
+    trade_war,
+    tariff_rate,
+    goods_tariffed_pct,
+    industrial_production,
+    pmi,
+    usd_index,
+    crude_oil_price,
+    d_log_industrial,
+    d_log_usd,
+    d_log_oil
+  )
+
+corr_matrix <- cor(correlation_data, use = "complete.obs")
+corrplot(corr_matrix, method = "color", tl.cex = 0.8)
+
+# ============================================================
+# 12. STATIONARITY TESTS
+# ============================================================
+
+stationarity_results <- bind_rows(
+  run_stationarity_tests(monthly_data$freight_rate, "freight_rate"),
+  run_stationarity_tests(monthly_data$log_freight, "log_freight"),
+  run_stationarity_tests(monthly_data$d_log_freight, "d_log_freight"),
+  run_stationarity_tests(monthly_data$industrial_production, "industrial_production"),
+  run_stationarity_tests(monthly_data$d_log_industrial, "d_log_industrial"),
+  run_stationarity_tests(monthly_data$usd_index, "usd_index"),
+  run_stationarity_tests(monthly_data$d_log_usd, "d_log_usd"),
+  run_stationarity_tests(monthly_data$crude_oil_price, "crude_oil_price"),
+  run_stationarity_tests(monthly_data$d_log_oil, "d_log_oil"),
+  run_stationarity_tests(monthly_data$daily_delay_rate, "daily_delay_rate"),
+  run_stationarity_tests(monthly_data$weather_stress_index, "weather_stress_index"),
+  run_stationarity_tests(monthly_data$pmi, "pmi"),
+  run_stationarity_tests(monthly_data$trade_war, "trade_war")
+)
+
+stationarity_results
+write_csv(stationarity_results, "stationarity_results.csv")
+
+# ============================================================
+# 13. BUILD CORE MODELLING DATASET
+# ============================================================
+
+model_data <- monthly_data %>%
+  dplyr::select(
+    month,
+    d_log_freight,
+    lag_d_log_freight,
+    
+    # Congestion candidates
+    daily_active_ships,
+    daily_port_arrivals,
+    daily_delay_rate,
+    daily_avg_turnaround_hours,
+    
+    # Weather
+    weather_stress_index,
+    
+    # Trade variables
+    trade_war,
+    tariff_rate,
+    goods_tariffed_pct,
+    
+    # Demand variables
+    d_log_industrial,
+    pmi,
+    
+    # Cost variables
+    d_log_oil
+  )
+
+# ============================================================
+# 14. CONGESTION PROXY COMPARISON
+# Same sample used across all congestion models
+# ============================================================
+
+congestion_compare_data <- model_data %>%
+  dplyr::select(
+    d_log_freight,
+    lag_d_log_freight,
+    daily_active_ships,
+    daily_port_arrivals,
+    daily_delay_rate,
+    daily_avg_turnaround_hours,
+    weather_stress_index,
+    trade_war,
+    d_log_industrial,
+    d_log_oil
+  ) %>%
+  drop_na()
+
+model_active_ships <- lm(
+  d_log_freight ~ lag_d_log_freight + daily_active_ships +
+    weather_stress_index + trade_war + d_log_industrial + d_log_oil,
+  data = congestion_compare_data
+)
+
+model_port_arrivals <- lm(
+  d_log_freight ~ lag_d_log_freight + daily_port_arrivals +
+    weather_stress_index + trade_war + d_log_industrial + d_log_oil,
+  data = congestion_compare_data
+)
+
+model_delay_rate <- lm(
+  d_log_freight ~ lag_d_log_freight + daily_delay_rate +
+    weather_stress_index + trade_war + d_log_industrial + d_log_oil,
+  data = congestion_compare_data
+)
+
+model_turnaround <- lm(
+  d_log_freight ~ lag_d_log_freight + daily_avg_turnaround_hours +
+    weather_stress_index + trade_war + d_log_industrial + d_log_oil,
+  data = congestion_compare_data
+)
+
+congestion_summary <- bind_rows(
+  extract_model_stats(model_active_ships, "active_ships"),
+  extract_model_stats(model_port_arrivals, "port_arrivals"),
+  extract_model_stats(model_delay_rate, "delay_rate"),
+  extract_model_stats(model_turnaround, "turnaround_hours")
+) %>%
+  arrange(aic)
+
+congestion_summary
+write_csv(congestion_summary, "congestion_proxy_comparison.csv")
+
+# ============================================================
+# 15. TRADE PROXY COMPARISON
+# Same sample used across all trade models
+# ============================================================
+
+trade_compare_data <- model_data %>%
+  dplyr::select(
+    d_log_freight,
+    lag_d_log_freight,
+    daily_delay_rate,
+    weather_stress_index,
+    trade_war,
+    tariff_rate,
+    goods_tariffed_pct,
+    d_log_industrial,
+    d_log_oil
+  ) %>%
+  drop_na()
+
+model_trade_dummy <- lm(
+  d_log_freight ~ lag_d_log_freight + daily_delay_rate +
+    weather_stress_index + trade_war + d_log_industrial + d_log_oil,
+  data = trade_compare_data
+)
+
+model_tariff_rate <- lm(
+  d_log_freight ~ lag_d_log_freight + daily_delay_rate +
+    weather_stress_index + tariff_rate + d_log_industrial + d_log_oil,
+  data = trade_compare_data
+)
+
+model_tariff_share <- lm(
+  d_log_freight ~ lag_d_log_freight + daily_delay_rate +
+    weather_stress_index + goods_tariffed_pct + d_log_industrial + d_log_oil,
+  data = trade_compare_data
+)
+
+trade_summary <- bind_rows(
+  extract_model_stats(model_trade_dummy, "trade_war_dummy"),
+  extract_model_stats(model_tariff_rate, "tariff_rate"),
+  extract_model_stats(model_tariff_share, "goods_tariffed_pct")
+) %>%
+  arrange(aic)
+
+trade_summary
+write_csv(trade_summary, "trade_proxy_comparison.csv")
+
+# ============================================================
+# 16. DEMAND PROXY COMPARISON
+# Same sample used across all demand models
+# ============================================================
+
+demand_compare_data <- model_data %>%
+  dplyr::select(
+    d_log_freight,
+    lag_d_log_freight,
+    daily_delay_rate,
+    weather_stress_index,
+    trade_war,
+    d_log_industrial,
+    pmi,
+    d_log_oil
+  ) %>%
+  drop_na()
+
+model_demand_industrial <- lm(
+  d_log_freight ~ lag_d_log_freight + daily_delay_rate +
+    weather_stress_index + trade_war + d_log_industrial + d_log_oil,
+  data = demand_compare_data
+)
+
+model_demand_pmi <- lm(
+  d_log_freight ~ lag_d_log_freight + daily_delay_rate +
+    weather_stress_index + trade_war + pmi + d_log_oil,
+  data = demand_compare_data
+)
+
+model_demand_none <- lm(
+  d_log_freight ~ lag_d_log_freight + daily_delay_rate +
+    weather_stress_index + trade_war + d_log_oil,
+  data = demand_compare_data
+)
+
+demand_summary <- bind_rows(
+  extract_model_stats(model_demand_industrial, "d_log_industrial"),
+  extract_model_stats(model_demand_pmi, "pmi"),
+  extract_model_stats(model_demand_none, "no_demand_variable")
+) %>%
+  arrange(aic)
+
+demand_summary
+write_csv(demand_summary, "demand_proxy_comparison.csv")
+
+# ============================================================
+# 17. FINAL BASELINE MODEL
+# Chosen structure:
+# - dependent variable: d_log_freight
+# - congestion: daily_delay_rate
+# - weather: weather_stress_index
+# - trade: trade_war
+# - demand: d_log_industrial
+# - cost: d_log_oil
+# ============================================================
+
+final_data <- model_data %>%
+  dplyr::select(
+    month,
+    d_log_freight,
+    lag_d_log_freight,
+    daily_delay_rate,
+    weather_stress_index,
+    trade_war,
+    d_log_industrial,
+    d_log_oil
+  ) %>%
+  drop_na()
+
+final_baseline <- lm(
+  d_log_freight ~ lag_d_log_freight +
+    daily_delay_rate +
+    weather_stress_index +
+    trade_war +
+    d_log_industrial +
+    d_log_oil,
+  data = final_data
+)
+
+summary(final_baseline)
+nw_coeftest(final_baseline, lag = 3)
+vif(final_baseline)
+
+
+# 17a. PARSIMONIOUS MODEL ROBUSTNESS
+
+final_minimal <- lm(
+  d_log_freight ~ lag_d_log_freight +
+    daily_delay_rate +
+    weather_stress_index +
+    trade_war,
+  data = final_data
+)
+
+summary(final_minimal)
+nw_coeftest(final_minimal, lag = 3)
+vif(final_minimal)
+
+minimal_model_stats <- extract_model_stats(final_minimal, "parsimonious_model")
+minimal_model_stats
+write_csv(minimal_model_stats, "parsimonious_model_stats.csv")
+
+minimal_nw_results <- broom::tidy(
+  nw_coeftest(final_minimal, lag = 3)
+) %>%
+  rename(
+    term = term,
+    estimate = estimate,
+    std_error = std.error,
+    statistic = statistic,
+    p_value = p.value
+  )
+
+minimal_nw_results
+write_csv(minimal_nw_results, "parsimonious_model_newey_west_results.csv")
+
+# 17b. BOOTSTRAP INFERENCE ROBUSTNESS
+
+set.seed(123)
+
+n_boot <- 2000
+
+X_baseline <- model.matrix(final_baseline)
+fitted_baseline <- fitted(final_baseline)
+resid_baseline <- residuals(final_baseline)
+
+boot_coef_mat <- matrix(
+  NA_real_,
+  nrow = n_boot,
+  ncol = ncol(X_baseline)
+)
+
+colnames(boot_coef_mat) <- colnames(X_baseline)
+
+for (b in 1:n_boot) {
+  boot_resid <- sample(resid_baseline, size = length(resid_baseline), replace = TRUE)
+  y_boot <- fitted_baseline + boot_resid
+  
+  boot_data <- final_data
+  boot_data$d_log_freight <- y_boot
+  
+  boot_model <- lm(
+    d_log_freight ~ lag_d_log_freight +
+      daily_delay_rate +
+      weather_stress_index +
+      trade_war +
+      d_log_industrial +
+      d_log_oil,
+    data = boot_data
+  )
+  
+  boot_coef_mat[b, ] <- coef(boot_model)
+}
+
+bootstrap_se <- apply(boot_coef_mat, 2, sd, na.rm = TRUE)
+
+baseline_coef <- coef(final_baseline)
+bootstrap_t <- baseline_coef / bootstrap_se
+bootstrap_p <- 2 * (1 - pnorm(abs(bootstrap_t)))
+
+bootstrap_ci <- t(apply(boot_coef_mat, 2, quantile, probs = c(0.025, 0.975), na.rm = TRUE))
+
+bootstrap_results <- tibble(
+  term = names(baseline_coef),
+  estimate = as.numeric(baseline_coef),
+  bootstrap_std_error = as.numeric(bootstrap_se),
+  bootstrap_t_stat = as.numeric(bootstrap_t),
+  bootstrap_p_value = as.numeric(bootstrap_p),
+  ci_lower_95 = bootstrap_ci[, 1],
+  ci_upper_95 = bootstrap_ci[, 2]
+)
+
+bootstrap_results
+write_csv(bootstrap_results, "baseline_bootstrap_results.csv")
+# ============================================================
+# 18. FINAL MODEL DIAGNOSTICS
+# ============================================================
+
+# Heteroskedasticity
+bptest(final_baseline)
+
+# White-style test
+bptest(final_baseline, ~ fitted(final_baseline) + I(fitted(final_baseline)^2))
+
+# Serial correlation
+dwtest(final_baseline)
+bgtest(final_baseline, order = 1)
+bgtest(final_baseline, order = 2)
+
+# Residual plots
+par(mfrow = c(2, 2))
+plot(final_baseline)
+par(mfrow = c(1, 1))
+
+# Residual autocorrelation
+acf(residuals(final_baseline), main = "ACF: Final Model Residuals")
+pacf(residuals(final_baseline), main = "PACF: Final Model Residuals")
+
+# Residual stationarity
+adf.test(residuals(final_baseline))
+
+# ============================================================
+# 19. INFLUENCE AND OUTLIER CHECK
+# ============================================================
+
+cooks <- cooks.distance(final_baseline)
+
+plot(cooks, type = "h", main = "Cook's Distance - Final Baseline")
+abline(h = 4 / length(cooks), col = "red", lty = 2)
+
+influence_table <- tibble(
+  month = final_data$month,
+  cooks_distance = cooks
+) %>%
+  arrange(desc(cooks_distance))
+
+influence_table
+write_csv(influence_table, "final_model_influence_table.csv")
+
+# Drop most influential observation as robustness check
+top_obs <- which.max(cooks)
+
+final_data_drop1 <- final_data[-top_obs, ]
+
+model_drop1 <- lm(
+  d_log_freight ~ lag_d_log_freight +
+    daily_delay_rate +
+    weather_stress_index +
+    trade_war +
+    d_log_industrial +
+    d_log_oil,
+  data = final_data_drop1
+)
+
+summary(model_drop1)
+nw_coeftest(model_drop1, lag = 3)
+
+# ============================================================
+# 20. ALTERNATIVE LAG ROBUSTNESS
+# ============================================================
+
+final_data_lag2 <- monthly_data %>%
+  dplyr::select(
+    month,
+    d_log_freight,
+    daily_delay_rate,
+    weather_stress_index,
+    trade_war,
+    d_log_industrial,
+    d_log_oil
+  ) %>%
+  arrange(month) %>%
+  mutate(
+    lag1_d_log_freight = lag(d_log_freight, 1),
+    lag2_d_log_freight = lag(d_log_freight, 2)
+  ) %>%
+  drop_na()
+
+model_lag2 <- lm(
+  d_log_freight ~ lag1_d_log_freight + lag2_d_log_freight +
+    daily_delay_rate + weather_stress_index + trade_war +
+    d_log_industrial + d_log_oil,
+  data = final_data_lag2
+)
+
+summary(model_lag2)
+nw_coeftest(model_lag2, lag = 3)
+
+# ============================================================
+# 21. ARIMA BENCHMARK
+# Univariate benchmark on d_log_freight
+# ============================================================
+
+dlog_freight_ts <- ts(final_data$d_log_freight, frequency = 12, start = c(2017, 3))
+
+# Visual diagnostics
+autoplot(dlog_freight_ts) +
+  ggtitle("d_log_freight Time Series") +
+  xlab("Year") +
+  ylab("d_log_freight")
+
+par(mfrow = c(1, 2))
+acf(dlog_freight_ts, main = "ACF: d_log_freight")
+pacf(dlog_freight_ts, main = "PACF: d_log_freight")
+par(mfrow = c(1, 1))
+
+# Candidate ARIMA models
+arima_auto <- auto.arima(
+  dlog_freight_ts,
+  seasonal = FALSE,
+  stepwise = FALSE,
+  approximation = FALSE
+)
+
+arima_100 <- Arima(dlog_freight_ts, order = c(1, 0, 0))
+arima_001 <- Arima(dlog_freight_ts, order = c(0, 0, 1))
+arima_101 <- Arima(dlog_freight_ts, order = c(1, 0, 1))
+
+arima_summary <- tibble(
+  model = c("auto.arima", "ARIMA(1,0,0)", "ARIMA(0,0,1)", "ARIMA(1,0,1)"),
+  aic = c(AIC(arima_auto), AIC(arima_100), AIC(arima_001), AIC(arima_101)),
+  bic = c(BIC(arima_auto), BIC(arima_100), BIC(arima_001), BIC(arima_101))
+) %>%
+  arrange(aic)
+
+arima_summary
+write_csv(arima_summary, "arima_model_comparison.csv")
+
+summary(arima_auto)
+checkresiduals(arima_auto)
+
+# ============================================================
+# 22. SIMPLE FORECAST COMPARISON
+# Compare:
+# - zero-change naive
+# - ARIMA
+# - final dynamic regression
+# Forecast target: d_log_freight
+# Holdout: final 6 months
+# ============================================================
+
+forecast_data <- final_data %>%
+  arrange(month)
+
+train_data <- forecast_data %>% slice(1:(n() - 6))
+test_data  <- forecast_data %>% slice((n() - 5):n())
+
+# ----------------------------
+# 22.1 Naive benchmark: forecast zero monthly change
+# ----------------------------
+naive_forecast <- rep(0, nrow(test_data))
+
+# ----------------------------
+# 22.2 ARIMA forecast
+# ----------------------------
+train_ts <- ts(train_data$d_log_freight, frequency = 12, start = c(2017, 3))
+arima_train <- auto.arima(
+  train_ts,
+  seasonal = FALSE,
+  stepwise = FALSE,
+  approximation = FALSE
+)
+
+arima_fc <- forecast(arima_train, h = nrow(test_data))
+arima_forecast <- as.numeric(arima_fc$mean)
+
+# ----------------------------
+# 22.3 Dynamic regression forecast
+# One-step-ahead recursive forecast
+# ----------------------------
+dynamic_forecasts <- c()
+
+rolling_data <- train_data
+
+for (i in 1:nrow(test_data)) {
+  model_i <- lm(
+    d_log_freight ~ lag_d_log_freight +
+      daily_delay_rate +
+      weather_stress_index +
+      trade_war +
+      d_log_industrial +
+      d_log_oil,
+    data = rolling_data
+  )
+  
+  next_obs <- test_data[i, ]
+  
+  pred_i <- predict(model_i, newdata = next_obs)
+  dynamic_forecasts <- c(dynamic_forecasts, pred_i)
+  
+  rolling_data <- bind_rows(rolling_data, next_obs)
+}
+
+# ----------------------------
+# 22.4 Accuracy comparison
+# ----------------------------
+actual <- test_data$d_log_freight
+
+rmse <- function(a, f) sqrt(mean((a - f)^2, na.rm = TRUE))
+mae  <- function(a, f) mean(abs(a - f), na.rm = TRUE)
+mape <- function(a, f) mean(abs((a - f) / a), na.rm = TRUE) * 100
+
+forecast_comparison <- tibble(
+  model = c("Naive_Zero_Change", "ARIMA", "Dynamic_Regression"),
+  RMSE = c(
+    rmse(actual, naive_forecast),
+    rmse(actual, arima_forecast),
+    rmse(actual, dynamic_forecasts)
+  ),
+  MAE = c(
+    mae(actual, naive_forecast),
+    mae(actual, arima_forecast),
+    mae(actual, dynamic_forecasts)
+  ),
+  MAPE = c(
+    mape(actual, naive_forecast),
+    mape(actual, arima_forecast),
+    mape(actual, dynamic_forecasts)
+  )
+) %>%
+  arrange(RMSE)
+
+forecast_comparison
+write_csv(forecast_comparison, "forecast_comparison.csv")
+
+forecast_results_tbl <- tibble(
+  month = test_data$month,
+  actual_d_log_freight = actual,
+  naive_zero_change = naive_forecast,
+  arima_forecast = arima_forecast,
+  dynamic_regression_forecast = dynamic_forecasts
+)
+
+forecast_results_tbl
+write_csv(forecast_results_tbl, "forecast_results_monthly.csv")
+
+ggplot(forecast_results_tbl, aes(x = month)) +
+  geom_line(aes(y = actual_d_log_freight, colour = "Actual")) +
+  geom_line(aes(y = naive_zero_change, colour = "Naive")) +
+  geom_line(aes(y = arima_forecast, colour = "ARIMA")) +
+  geom_line(aes(y = dynamic_regression_forecast, colour = "Dynamic Regression")) +
+  theme_minimal() +
+  labs(
+    title = "Forecast Comparison: Monthly Freight Growth",
+    x = "Month",
+    y = "d_log_freight",
+    colour = NULL
+  )
+
+# ============================================================
+# 23. EXPORT FINAL CORE DATASETS
+# ============================================================
+
+write_csv(monthly_data, "monthly_data_final.csv")
+write_csv(final_data, "final_model_data.csv")
+

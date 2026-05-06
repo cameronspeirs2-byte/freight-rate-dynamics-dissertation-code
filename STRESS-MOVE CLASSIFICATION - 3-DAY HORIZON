@@ -1,0 +1,951 @@
+# ============================================================
+# DISSERTATION ML SCRIPT: STRESS-MOVE CLASSIFICATION
+# 3-DAY HORIZON — RECALL-FOCUSED WITH RESTRICTED XGBOOST TUNING
+# ============================================================
+# Purpose:
+# Predict whether freight rates experience an unusually large
+# 3-day repricing episode ("stress move").
+#
+# Binary target:
+#   1 = absolute h-day forward freight return exceeds stress threshold
+#   0 = otherwise
+#
+# Core design:
+#   - expanding-window forecasting
+#   - stress threshold estimated only from initial training sample
+#   - XGBoost eta and nrounds selected using initial training sample only
+#   - recall-first probability cutoff selection on each expanding training window
+#   - positive-class weighting to penalise missed stress events
+#   - all features restricted to information observable at time t
+#
+# Important:
+#   This script assumes that the daily ML master dataset `df` already exists
+#   in the R environment.
+# ============================================================
+
+
+# ============================================================
+# 0. LIBRARIES
+# ============================================================
+
+library(tidyverse)
+library(lubridate)
+library(zoo)
+library(slider)
+library(glmnet)
+library(xgboost)
+library(fastDummies)
+library(pROC)
+
+
+# ============================================================
+# 1. SETTINGS
+# ============================================================
+
+forecast_horizon <- 3
+initial_train <- 500
+set.seed(123)
+
+# Stress-event definition:
+# 0.75 means top 25% of absolute h-day returns in the initial training sample.
+stress_quantile <- 0.75
+
+# Recall-focused classification rule.
+threshold_objective <- "recall_with_precision_floor"
+min_precision_floor <- 0.50
+candidate_cutoffs <- seq(0.10, 0.70, by = 0.01)
+
+# Class weighting.
+positive_weight_multiplier_enet <- 1.50
+positive_weight_multiplier_xgb  <- 1.25
+
+# XGBoost complexity parameters fixed for parsimony.
+# Only eta and nrounds are tuned below.
+xgb_max_depth <- 3
+xgb_min_child_weight <- 4
+xgb_subsample <- 0.85
+xgb_colsample_bytree <- 0.85
+
+# Restricted tuning grid.
+xgb_eta_grid <- c(0.02, 0.04, 0.05, 0.06, 0.08)
+xgb_nrounds_grid <- c(75L, 100L, 150L, 250L, 350L)
+
+# Output prefix.
+output_prefix <- "stress_classification_3day_tuned"
+
+
+# ============================================================
+# 2. PREPARE BASE DATA
+# ============================================================
+
+if (!exists("df")) {
+  stop("df is not available. Build the daily ML master dataset first.")
+}
+
+required_vars <- c(
+  "date",
+  "freight_rate",
+  "daily_delay_rate",
+  "daily_active_ships",
+  "daily_port_arrivals",
+  "daily_avg_turnaround_hours",
+  "weather_stress_index",
+  "joint_storm_dummy",
+  "crude_oil_price",
+  "trade_war",
+  "tariff_rate",
+  "goods_tariffed_pct"
+)
+
+missing_vars <- setdiff(required_vars, names(df))
+if (length(missing_vars) > 0) {
+  stop(paste("Missing required variables in df:", paste(missing_vars, collapse = ", ")))
+}
+
+base_df <- df %>%
+  mutate(
+    date = as.Date(date),
+    crude_oil_price = zoo::na.locf(crude_oil_price, na.rm = FALSE),
+    log_freight = log(freight_rate),
+    d_log_freight = log_freight - lag(log_freight)
+  ) %>%
+  arrange(date)
+
+
+# ============================================================
+# 3. INITIAL THRESHOLDS FROM INITIAL TRAINING SAMPLE ONLY
+# ============================================================
+
+threshold_ref <- base_df %>%
+  filter(!is.na(d_log_freight)) %>%
+  slice(1:initial_train)
+
+delay_p90    <- quantile(threshold_ref$daily_delay_rate, 0.90, na.rm = TRUE)
+weather_p90  <- quantile(threshold_ref$weather_stress_index, 0.90, na.rm = TRUE)
+arrivals_p10 <- quantile(threshold_ref$daily_port_arrivals, 0.10, na.rm = TRUE)
+
+threshold_ref <- threshold_ref %>%
+  mutate(d_log_oil_ref = log(crude_oil_price) - log(lag(crude_oil_price)))
+
+oil_abs_p90 <- quantile(abs(threshold_ref$d_log_oil_ref), 0.90, na.rm = TRUE)
+
+threshold_ref_h <- base_df %>%
+  arrange(date) %>%
+  mutate(h_forward_return_ref = lead(log_freight, forecast_horizon) - log_freight) %>%
+  filter(!is.na(h_forward_return_ref)) %>%
+  slice(1:initial_train)
+
+stress_threshold <- quantile(
+  abs(threshold_ref_h$h_forward_return_ref),
+  stress_quantile,
+  na.rm = TRUE
+)
+
+cat("------------------------------------------------------------\n")
+cat("Forecast horizon =", forecast_horizon, "days\n")
+cat("Stress threshold quantile =", stress_quantile, "\n")
+cat("Stress threshold =", round(stress_threshold, 6), "\n")
+cat("Threshold objective =", threshold_objective, "\n")
+cat("Minimum precision floor =", min_precision_floor, "\n")
+cat("------------------------------------------------------------\n")
+
+
+# ============================================================
+# 4. FEATURE ENGINEERING
+# ============================================================
+
+feature_df <- base_df %>%
+  arrange(date) %>%
+  mutate(
+    # --------------------------------------------------------
+    # TARGETS
+    # --------------------------------------------------------
+    target_h_return = lead(log_freight, forecast_horizon) - log_freight,
+    target_stress_move = if_else(abs(target_h_return) >= stress_threshold, 1L, 0L),
+
+    # --------------------------------------------------------
+    # COMPLETED PAST HORIZON RETURN
+    # This is observable at time t and is used for the persistence benchmark.
+    # --------------------------------------------------------
+    past_h_return = log_freight - lag(log_freight, forecast_horizon),
+    current_past_stress = if_else(abs(past_h_return) >= stress_threshold, 1L, 0L),
+    prev_past_stress = lag(current_past_stress, 1),
+
+    # --------------------------------------------------------
+    # Freight dynamics
+    # --------------------------------------------------------
+    lag1_return  = lag(d_log_freight, 1),
+    lag3_return  = lag(d_log_freight, 3),
+    lag5_return  = lag(d_log_freight, 5),
+    lag7_return  = lag(d_log_freight, 7),
+    lag14_return = lag(d_log_freight, 14),
+
+    abs_lag1_return = abs(lag1_return),
+    abs_lag3_return = abs(lag3_return),
+    abs_lag5_return = abs(lag5_return),
+    abs_lag7_return = abs(lag7_return),
+
+    roll_mean_3_return  = lag(slider::slide_dbl(d_log_freight, mean, .before = 2,  .complete = TRUE), 1),
+    roll_mean_5_return  = lag(slider::slide_dbl(d_log_freight, mean, .before = 4,  .complete = TRUE), 1),
+    roll_mean_7_return  = lag(slider::slide_dbl(d_log_freight, mean, .before = 6,  .complete = TRUE), 1),
+    roll_mean_14_return = lag(slider::slide_dbl(d_log_freight, mean, .before = 13, .complete = TRUE), 1),
+
+    roll_sd_3_return  = lag(slider::slide_dbl(d_log_freight, sd, .before = 2,  .complete = TRUE), 1),
+    roll_sd_5_return  = lag(slider::slide_dbl(d_log_freight, sd, .before = 4,  .complete = TRUE), 1),
+    roll_sd_7_return  = lag(slider::slide_dbl(d_log_freight, sd, .before = 6,  .complete = TRUE), 1),
+    roll_sd_14_return = lag(slider::slide_dbl(d_log_freight, sd, .before = 13, .complete = TRUE), 1),
+
+    # --------------------------------------------------------
+    # AIS variables
+    # --------------------------------------------------------
+    d_delay_rate    = daily_delay_rate - lag(daily_delay_rate),
+    d_port_arrivals = daily_port_arrivals - lag(daily_port_arrivals),
+    d_turnaround    = daily_avg_turnaround_hours - lag(daily_avg_turnaround_hours),
+
+    lag1_delay_rate  = lag(daily_delay_rate, 1),
+    lag3_delay_rate  = lag(daily_delay_rate, 3),
+    lag5_delay_rate  = lag(daily_delay_rate, 5),
+    lag7_delay_rate  = lag(daily_delay_rate, 7),
+    lag14_delay_rate = lag(daily_delay_rate, 14),
+
+    lag1_port_arrivals  = lag(daily_port_arrivals, 1),
+    lag3_port_arrivals  = lag(daily_port_arrivals, 3),
+    lag5_port_arrivals  = lag(daily_port_arrivals, 5),
+    lag7_port_arrivals  = lag(daily_port_arrivals, 7),
+    lag14_port_arrivals = lag(daily_port_arrivals, 14),
+
+    lag1_turnaround  = lag(daily_avg_turnaround_hours, 1),
+    lag3_turnaround  = lag(daily_avg_turnaround_hours, 3),
+    lag5_turnaround  = lag(daily_avg_turnaround_hours, 5),
+    lag7_turnaround  = lag(daily_avg_turnaround_hours, 7),
+    lag14_turnaround = lag(daily_avg_turnaround_hours, 14),
+
+    roll_mean_3_delay_rate  = lag(slider::slide_dbl(daily_delay_rate, mean, .before = 2,  .complete = TRUE), 1),
+    roll_mean_5_delay_rate  = lag(slider::slide_dbl(daily_delay_rate, mean, .before = 4,  .complete = TRUE), 1),
+    roll_mean_7_delay_rate  = lag(slider::slide_dbl(daily_delay_rate, mean, .before = 6,  .complete = TRUE), 1),
+    roll_mean_14_delay_rate = lag(slider::slide_dbl(daily_delay_rate, mean, .before = 13, .complete = TRUE), 1),
+
+    roll_mean_3_arrivals  = lag(slider::slide_dbl(daily_port_arrivals, mean, .before = 2,  .complete = TRUE), 1),
+    roll_mean_5_arrivals  = lag(slider::slide_dbl(daily_port_arrivals, mean, .before = 4,  .complete = TRUE), 1),
+    roll_mean_7_arrivals  = lag(slider::slide_dbl(daily_port_arrivals, mean, .before = 6,  .complete = TRUE), 1),
+    roll_mean_14_arrivals = lag(slider::slide_dbl(daily_port_arrivals, mean, .before = 13, .complete = TRUE), 1),
+
+    # --------------------------------------------------------
+    # Weather variables
+    # --------------------------------------------------------
+    d_weather_stress = weather_stress_index - lag(weather_stress_index),
+
+    lag1_weather_stress  = lag(weather_stress_index, 1),
+    lag3_weather_stress  = lag(weather_stress_index, 3),
+    lag5_weather_stress  = lag(weather_stress_index, 5),
+    lag7_weather_stress  = lag(weather_stress_index, 7),
+    lag14_weather_stress = lag(weather_stress_index, 14),
+
+    lag1_joint_storm  = lag(joint_storm_dummy, 1),
+    lag3_joint_storm  = lag(joint_storm_dummy, 3),
+    lag5_joint_storm  = lag(joint_storm_dummy, 5),
+    lag7_joint_storm  = lag(joint_storm_dummy, 7),
+    lag14_joint_storm = lag(joint_storm_dummy, 14),
+
+    roll_mean_3_weather_stress  = lag(slider::slide_dbl(weather_stress_index, mean, .before = 2,  .complete = TRUE), 1),
+    roll_mean_5_weather_stress  = lag(slider::slide_dbl(weather_stress_index, mean, .before = 4,  .complete = TRUE), 1),
+    roll_mean_7_weather_stress  = lag(slider::slide_dbl(weather_stress_index, mean, .before = 6,  .complete = TRUE), 1),
+    roll_mean_14_weather_stress = lag(slider::slide_dbl(weather_stress_index, mean, .before = 13, .complete = TRUE), 1),
+
+    # --------------------------------------------------------
+    # Oil variables
+    # --------------------------------------------------------
+    d_log_oil = log(crude_oil_price) - log(lag(crude_oil_price)),
+    lag1_d_log_oil  = lag(d_log_oil, 1),
+    lag3_d_log_oil  = lag(d_log_oil, 3),
+    lag5_d_log_oil  = lag(d_log_oil, 5),
+    lag7_d_log_oil  = lag(d_log_oil, 7),
+    lag14_d_log_oil = lag(d_log_oil, 14),
+
+    abs_lag1_d_log_oil = abs(lag1_d_log_oil),
+    abs_lag3_d_log_oil = abs(lag3_d_log_oil),
+    abs_lag5_d_log_oil = abs(lag5_d_log_oil),
+
+    roll_mean_3_d_log_oil  = lag(slider::slide_dbl(d_log_oil, mean, .before = 2, .complete = TRUE), 1),
+    roll_mean_5_d_log_oil  = lag(slider::slide_dbl(d_log_oil, mean, .before = 4, .complete = TRUE), 1),
+    roll_mean_7_d_log_oil  = lag(slider::slide_dbl(d_log_oil, mean, .before = 6, .complete = TRUE), 1),
+    roll_sd_7_d_log_oil    = lag(slider::slide_dbl(d_log_oil, sd,   .before = 6, .complete = TRUE), 1),
+
+    # --------------------------------------------------------
+    # Shock / regime indicators
+    # --------------------------------------------------------
+    shock_delay   = if_else(daily_delay_rate >= delay_p90, 1L, 0L),
+    shock_weather = if_else(weather_stress_index >= weather_p90, 1L, 0L),
+    shock_oil     = if_else(abs(d_log_oil) >= oil_abs_p90, 1L, 0L),
+    low_activity  = if_else(daily_port_arrivals <= arrivals_p10, 1L, 0L),
+
+    # --------------------------------------------------------
+    # Interactions
+    # --------------------------------------------------------
+    weather_x_delay        = weather_stress_index * daily_delay_rate,
+    oil_x_delay            = d_log_oil * daily_delay_rate,
+    tradewar_x_delay       = trade_war * daily_delay_rate,
+    weather_x_arrival      = weather_stress_index * daily_port_arrivals,
+    shock_weather_x_delay  = shock_weather * daily_delay_rate,
+    shock_oil_x_delay      = shock_oil * daily_delay_rate,
+
+    # --------------------------------------------------------
+    # Calendar
+    # --------------------------------------------------------
+    weekday = lubridate::wday(date, label = TRUE),
+    month = lubridate::month(date, label = TRUE),
+    doy = lubridate::yday(date),
+    doy_sin = sin(2 * pi * doy / 365.25),
+    doy_cos = cos(2 * pi * doy / 365.25)
+  ) %>%
+  dplyr::select(
+    date,
+    target_stress_move,
+    target_h_return,
+    past_h_return,
+
+    lag1_return, lag3_return, lag5_return, lag7_return, lag14_return,
+    abs_lag1_return, abs_lag3_return, abs_lag5_return, abs_lag7_return,
+    roll_mean_3_return, roll_mean_5_return, roll_mean_7_return, roll_mean_14_return,
+    roll_sd_3_return, roll_sd_5_return, roll_sd_7_return, roll_sd_14_return,
+    current_past_stress, prev_past_stress,
+
+    daily_delay_rate, daily_active_ships, daily_port_arrivals, daily_avg_turnaround_hours,
+    d_delay_rate, d_port_arrivals, d_turnaround,
+    lag1_delay_rate, lag3_delay_rate, lag5_delay_rate, lag7_delay_rate, lag14_delay_rate,
+    lag1_port_arrivals, lag3_port_arrivals, lag5_port_arrivals, lag7_port_arrivals, lag14_port_arrivals,
+    lag1_turnaround, lag3_turnaround, lag5_turnaround, lag7_turnaround, lag14_turnaround,
+    roll_mean_3_delay_rate, roll_mean_5_delay_rate, roll_mean_7_delay_rate, roll_mean_14_delay_rate,
+    roll_mean_3_arrivals, roll_mean_5_arrivals, roll_mean_7_arrivals, roll_mean_14_arrivals,
+
+    weather_stress_index, joint_storm_dummy,
+    d_weather_stress,
+    lag1_weather_stress, lag3_weather_stress, lag5_weather_stress, lag7_weather_stress, lag14_weather_stress,
+    lag1_joint_storm, lag3_joint_storm, lag5_joint_storm, lag7_joint_storm, lag14_joint_storm,
+    roll_mean_3_weather_stress, roll_mean_5_weather_stress, roll_mean_7_weather_stress, roll_mean_14_weather_stress,
+
+    d_log_oil, lag1_d_log_oil, lag3_d_log_oil, lag5_d_log_oil, lag7_d_log_oil, lag14_d_log_oil,
+    abs_lag1_d_log_oil, abs_lag3_d_log_oil, abs_lag5_d_log_oil,
+    roll_mean_3_d_log_oil, roll_mean_5_d_log_oil, roll_mean_7_d_log_oil, roll_sd_7_d_log_oil,
+
+    trade_war, tariff_rate, goods_tariffed_pct,
+
+    shock_delay, shock_weather, shock_oil, low_activity,
+    weather_x_delay, oil_x_delay, tradewar_x_delay,
+    weather_x_arrival, shock_weather_x_delay, shock_oil_x_delay,
+
+    weekday, month, doy_sin, doy_cos
+  ) %>%
+  tidyr::drop_na()
+
+model_df <- feature_df %>%
+  fastDummies::dummy_cols(
+    select_columns = c("weekday", "month"),
+    remove_first_dummy = TRUE,
+    remove_selected_columns = TRUE
+  )
+
+cat("Rows in model_df:", nrow(model_df), "\n")
+cat("Positive class share:", round(mean(model_df$target_stress_move), 4), "\n")
+print(table(model_df$target_stress_move))
+
+
+# ============================================================
+# 5. DEFINE FEATURES
+# ============================================================
+
+target_var <- "target_stress_move"
+
+# Exclude direct target variables and the raw forward return.
+# past_h_return is excluded because it is continuous and mechanically aligned
+# with the persistence benchmark. The binary current_past_stress remains as
+# an observable feature.
+feature_vars <- setdiff(
+  names(model_df),
+  c("date", target_var, "target_h_return", "past_h_return")
+)
+
+n <- nrow(model_df)
+
+if (n <= initial_train) {
+  stop("Not enough rows after feature engineering.")
+}
+
+
+# ============================================================
+# 6. HELPER FUNCTIONS
+# ============================================================
+
+safe_divide <- function(num, den) {
+  ifelse(den == 0, NA_real_, num / den)
+}
+
+metric_bundle <- function(actual, pred_class, pred_prob) {
+  actual <- as.integer(actual)
+  pred_class <- as.integer(pred_class)
+  pred_prob <- as.numeric(pred_prob)
+
+  tp <- sum(actual == 1 & pred_class == 1, na.rm = TRUE)
+  tn <- sum(actual == 0 & pred_class == 0, na.rm = TRUE)
+  fp <- sum(actual == 0 & pred_class == 1, na.rm = TRUE)
+  fn <- sum(actual == 1 & pred_class == 0, na.rm = TRUE)
+
+  accuracy <- mean(actual == pred_class, na.rm = TRUE)
+  precision <- safe_divide(tp, tp + fp)
+  recall <- safe_divide(tp, tp + fn)
+  specificity <- safe_divide(tn, tn + fp)
+
+  f1 <- ifelse(
+    is.na(precision) | is.na(recall) | (precision + recall == 0),
+    NA_real_,
+    2 * precision * recall / (precision + recall)
+  )
+
+  f2 <- ifelse(
+    is.na(precision) | is.na(recall) | ((4 * precision + recall) == 0),
+    NA_real_,
+    5 * precision * recall / (4 * precision + recall)
+  )
+
+  balanced_accuracy <- mean(c(recall, specificity), na.rm = TRUE)
+
+  auc_val <- tryCatch(
+    as.numeric(pROC::roc(response = actual, predictor = pred_prob, quiet = TRUE)$auc),
+    error = function(e) NA_real_
+  )
+
+  tibble::tibble(
+    Accuracy = accuracy,
+    Balanced_Accuracy = balanced_accuracy,
+    Precision = precision,
+    Recall = recall,
+    Specificity = specificity,
+    F1 = f1,
+    F2 = f2,
+    ROC_AUC = auc_val
+  )
+}
+
+choose_best_cutoff <- function(actual,
+                               probs,
+                               cutoffs,
+                               objective = "recall_with_precision_floor",
+                               min_precision = 0.50) {
+  actual <- as.integer(actual)
+  probs <- as.numeric(probs)
+
+  eval_tbl <- purrr::map_dfr(cutoffs, function(cut) {
+    pred <- ifelse(probs >= cut, 1L, 0L)
+    m <- metric_bundle(actual, pred, probs)
+
+    tibble::tibble(
+      cutoff = cut,
+      Precision = m$Precision,
+      Recall = m$Recall,
+      F1 = m$F1,
+      F2 = m$F2,
+      Balanced_Accuracy = m$Balanced_Accuracy
+    )
+  })
+
+  if (objective == "recall_with_precision_floor") {
+    eligible <- eval_tbl %>%
+      filter(!is.na(Precision), !is.na(Recall), Precision >= min_precision)
+
+    if (nrow(eligible) > 0) {
+      return(
+        eligible %>%
+          arrange(desc(Recall), desc(F1), desc(Balanced_Accuracy), cutoff) %>%
+          slice(1) %>%
+          pull(cutoff)
+      )
+    }
+
+    # Fallback if no cutoff reaches the floor.
+    return(
+      eval_tbl %>%
+        filter(!is.na(F1)) %>%
+        arrange(desc(F1), desc(Balanced_Accuracy), desc(Recall), cutoff) %>%
+        slice(1) %>%
+        pull(cutoff)
+    )
+  }
+
+  if (objective == "pure_recall") {
+    return(
+      eval_tbl %>%
+        filter(!is.na(Recall)) %>%
+        arrange(desc(Recall), desc(F1), cutoff) %>%
+        slice(1) %>%
+        pull(cutoff)
+    )
+  }
+
+  if (objective == "balanced_accuracy") {
+    return(
+      eval_tbl %>%
+        filter(!is.na(Balanced_Accuracy)) %>%
+        arrange(desc(Balanced_Accuracy), desc(Recall), cutoff) %>%
+        slice(1) %>%
+        pull(cutoff)
+    )
+  }
+
+  if (objective == "f2") {
+    return(
+      eval_tbl %>%
+        filter(!is.na(F2)) %>%
+        arrange(desc(F2), desc(F1), desc(Recall), cutoff) %>%
+        slice(1) %>%
+        pull(cutoff)
+    )
+  }
+
+  eval_tbl %>%
+    filter(!is.na(F1)) %>%
+    arrange(desc(F1), desc(Recall), cutoff) %>%
+    slice(1) %>%
+    pull(cutoff)
+}
+
+confusion_summary <- function(actual, pred_class, model_name) {
+  tibble::tibble(
+    Model = model_name,
+    TP = sum(actual == 1 & pred_class == 1, na.rm = TRUE),
+    TN = sum(actual == 0 & pred_class == 0, na.rm = TRUE),
+    FP = sum(actual == 0 & pred_class == 1, na.rm = TRUE),
+    FN = sum(actual == 1 & pred_class == 0, na.rm = TRUE)
+  )
+}
+
+
+# ============================================================
+# 6A. RESTRICTED XGBOOST HYPERPARAMETER TUNING
+# Select eta and nrounds using initial training sample only
+# ============================================================
+
+set.seed(123)
+
+tune_data <- model_df[1:initial_train, , drop = FALSE]
+
+# Chronological inner validation split.
+tune_valid_n <- floor(0.20 * nrow(tune_data))
+tune_train_n <- nrow(tune_data) - tune_valid_n
+
+tune_train <- tune_data[1:tune_train_n, , drop = FALSE]
+tune_valid <- tune_data[(tune_train_n + 1):nrow(tune_data), , drop = FALSE]
+
+x_tune_train <- as.matrix(tune_train[, feature_vars, drop = FALSE])
+y_tune_train <- as.integer(tune_train[[target_var]])
+
+x_tune_valid <- as.matrix(tune_valid[, feature_vars, drop = FALSE])
+y_tune_valid <- as.integer(tune_valid[[target_var]])
+
+pos_count_tune <- sum(y_tune_train == 1, na.rm = TRUE)
+neg_count_tune <- sum(y_tune_train == 0, na.rm = TRUE)
+
+scale_pos_weight_tune <- positive_weight_multiplier_xgb *
+  (neg_count_tune / max(pos_count_tune, 1))
+
+d_tune_train <- xgboost::xgb.DMatrix(
+  data = x_tune_train,
+  label = y_tune_train
+)
+
+d_tune_valid <- xgboost::xgb.DMatrix(
+  data = x_tune_valid,
+  label = y_tune_valid
+)
+
+xgb_grid <- tidyr::crossing(
+  eta = xgb_eta_grid,
+  nrounds = xgb_nrounds_grid
+)
+
+xgb_tuning_results <- purrr::map_dfr(seq_len(nrow(xgb_grid)), function(g) {
+
+  eta_g <- xgb_grid$eta[g]
+  nrounds_g <- as.integer(xgb_grid$nrounds[g])
+
+  fit_g <- xgboost::xgb.train(
+    params = list(
+      objective = "binary:logistic",
+      eval_metric = "logloss",
+      max_depth = xgb_max_depth,
+      eta = eta_g,
+      min_child_weight = xgb_min_child_weight,
+      subsample = xgb_subsample,
+      colsample_bytree = xgb_colsample_bytree,
+      scale_pos_weight = scale_pos_weight_tune,
+      verbosity = 0
+    ),
+    data = d_tune_train,
+    nrounds = nrounds_g
+  )
+
+  train_prob_g <- as.numeric(predict(fit_g, newdata = d_tune_train))
+  valid_prob_g <- as.numeric(predict(fit_g, newdata = d_tune_valid))
+
+  cutoff_g <- choose_best_cutoff(
+    actual = y_tune_train,
+    probs = train_prob_g,
+    cutoffs = candidate_cutoffs,
+    objective = threshold_objective,
+    min_precision = min_precision_floor
+  )
+
+  valid_pred_g <- ifelse(valid_prob_g >= cutoff_g, 1L, 0L)
+
+  m_valid <- metric_bundle(
+    actual = y_tune_valid,
+    pred_class = valid_pred_g,
+    pred_prob = valid_prob_g
+  )
+
+  tibble::tibble(
+    horizon = forecast_horizon,
+    eta = eta_g,
+    nrounds = nrounds_g,
+    selected_cutoff = cutoff_g,
+    validation_Accuracy = m_valid$Accuracy,
+    validation_Balanced_Accuracy = m_valid$Balanced_Accuracy,
+    validation_Precision = m_valid$Precision,
+    validation_Recall = m_valid$Recall,
+    validation_Specificity = m_valid$Specificity,
+    validation_F1 = m_valid$F1,
+    validation_F2 = m_valid$F2,
+    validation_ROC_AUC = m_valid$ROC_AUC
+  )
+})
+
+xgb_tuning_feasible <- xgb_tuning_results %>%
+  filter(!is.na(validation_Precision), validation_Precision >= min_precision_floor)
+
+if (nrow(xgb_tuning_feasible) > 0) {
+  best_xgb_params <- xgb_tuning_feasible %>%
+    arrange(
+      desc(validation_Recall),
+      desc(validation_F1),
+      desc(validation_ROC_AUC),
+      desc(validation_Balanced_Accuracy)
+    ) %>%
+    slice(1)
+} else {
+  best_xgb_params <- xgb_tuning_results %>%
+    arrange(
+      desc(validation_F1),
+      desc(validation_ROC_AUC),
+      desc(validation_Balanced_Accuracy),
+      desc(validation_Recall)
+    ) %>%
+    slice(1)
+}
+
+selected_xgb_eta <- best_xgb_params$eta
+selected_xgb_nrounds <- as.integer(best_xgb_params$nrounds)
+
+cat("Selected XGBoost classification parameters for", forecast_horizon, "day horizon:\n")
+cat("eta =", selected_xgb_eta, "\n")
+cat("nrounds =", selected_xgb_nrounds, "\n")
+
+readr::write_csv(
+  xgb_tuning_results,
+  paste0("xgb_classification_tuning_", forecast_horizon, "day.csv")
+)
+
+readr::write_csv(
+  best_xgb_params,
+  paste0("xgb_classification_best_params_", forecast_horizon, "day.csv")
+)
+
+
+# ============================================================
+# 7. RESULTS OBJECT
+# ============================================================
+
+results <- tibble::tibble(
+  date = model_df$date[(initial_train + 1):n],
+  actual = model_df[[target_var]][(initial_train + 1):n],
+
+  prob_majority = NA_real_,
+  pred_majority = NA_integer_,
+
+  prob_persistence = NA_real_,
+  pred_persistence = NA_integer_,
+
+  prob_enet = NA_real_,
+  pred_enet = NA_integer_,
+  cutoff_enet = NA_real_,
+
+  prob_xgb = NA_real_,
+  pred_xgb = NA_integer_,
+  cutoff_xgb = NA_real_
+)
+
+
+# ============================================================
+# 8. EXPANDING-WINDOW FORECAST LOOP
+# ============================================================
+
+for (i in (initial_train + 1):n) {
+
+  train_data <- model_df[1:(i - 1), , drop = FALSE]
+  test_data  <- model_df[i, , drop = FALSE]
+  j <- i - initial_train
+
+  x_train <- as.matrix(train_data[, feature_vars, drop = FALSE])
+  y_train <- as.integer(train_data[[target_var]])
+  x_test  <- as.matrix(test_data[, feature_vars, drop = FALSE])
+
+  pos_count <- sum(y_train == 1, na.rm = TRUE)
+  neg_count <- sum(y_train == 0, na.rm = TRUE)
+  base_pos_weight <- neg_count / max(pos_count, 1)
+
+  # ----------------------------------------------------------
+  # Benchmark 1: Majority benchmark
+  # ----------------------------------------------------------
+  train_pos_rate <- mean(y_train, na.rm = TRUE)
+  majority_class <- ifelse(train_pos_rate >= 0.5, 1L, 0L)
+
+  results$prob_majority[j] <- train_pos_rate
+  results$pred_majority[j] <- majority_class
+
+  # ----------------------------------------------------------
+  # Benchmark 2: past-horizon persistence benchmark
+  # ----------------------------------------------------------
+  persistence_prob <- as.numeric(test_data$current_past_stress)
+  persistence_prob <- ifelse(is.na(persistence_prob), 0, persistence_prob)
+  persistence_class <- ifelse(persistence_prob >= 0.5, 1L, 0L)
+
+  results$prob_persistence[j] <- persistence_prob
+  results$pred_persistence[j] <- persistence_class
+
+  # ----------------------------------------------------------
+  # Elastic Net logistic regression
+  # ----------------------------------------------------------
+  obs_weights <- ifelse(
+    y_train == 1,
+    base_pos_weight * positive_weight_multiplier_enet,
+    1
+  )
+
+  enet_fit <- glmnet::cv.glmnet(
+    x = x_train,
+    y = y_train,
+    family = "binomial",
+    alpha = 0.5,
+    nfolds = 5,
+    weights = obs_weights,
+    type.measure = "deviance"
+  )
+
+  enet_train_prob <- as.numeric(
+    predict(enet_fit, newx = x_train, s = "lambda.min", type = "response")
+  )
+
+  best_cut_enet <- choose_best_cutoff(
+    actual = y_train,
+    probs = enet_train_prob,
+    cutoffs = candidate_cutoffs,
+    objective = threshold_objective,
+    min_precision = min_precision_floor
+  )
+
+  enet_test_prob <- as.numeric(
+    predict(enet_fit, newx = x_test, s = "lambda.min", type = "response")
+  )
+
+  enet_test_class <- ifelse(enet_test_prob >= best_cut_enet, 1L, 0L)
+
+  results$prob_enet[j] <- enet_test_prob
+  results$pred_enet[j] <- enet_test_class
+  results$cutoff_enet[j] <- best_cut_enet
+
+  # ----------------------------------------------------------
+  # XGBoost classifier using restricted tuned parameters
+  # ----------------------------------------------------------
+  xgb_scale_pos_weight <- base_pos_weight * positive_weight_multiplier_xgb
+
+  dtrain <- xgboost::xgb.DMatrix(
+    data = x_train,
+    label = y_train
+  )
+
+  dtest <- xgboost::xgb.DMatrix(
+    data = x_test
+  )
+
+  xgb_fit <- xgboost::xgb.train(
+    params = list(
+      objective = "binary:logistic",
+      eval_metric = "logloss",
+      max_depth = xgb_max_depth,
+      eta = selected_xgb_eta,
+      min_child_weight = xgb_min_child_weight,
+      subsample = xgb_subsample,
+      colsample_bytree = xgb_colsample_bytree,
+      scale_pos_weight = xgb_scale_pos_weight,
+      verbosity = 0
+    ),
+    data = dtrain,
+    nrounds = selected_xgb_nrounds
+  )
+
+  xgb_train_prob <- as.numeric(predict(xgb_fit, newdata = dtrain))
+
+  best_cut_xgb <- choose_best_cutoff(
+    actual = y_train,
+    probs = xgb_train_prob,
+    cutoffs = candidate_cutoffs,
+    objective = threshold_objective,
+    min_precision = min_precision_floor
+  )
+
+  xgb_test_prob <- as.numeric(predict(xgb_fit, newdata = dtest))
+  xgb_test_class <- ifelse(xgb_test_prob >= best_cut_xgb, 1L, 0L)
+
+  results$prob_xgb[j] <- xgb_test_prob
+  results$pred_xgb[j] <- xgb_test_class
+  results$cutoff_xgb[j] <- best_cut_xgb
+
+  if (j %% 25 == 0) {
+    cat("Completed forecast", j, "of", n - initial_train, "\n")
+  }
+}
+
+
+# ============================================================
+# 9. PERFORMANCE TABLE
+# ============================================================
+
+performance_table <- dplyr::bind_rows(
+  metric_bundle(results$actual, results$pred_majority, results$prob_majority) %>%
+    mutate(Horizon = paste0(forecast_horizon, "-day"), Model = "Majority benchmark", Model_Order = 1),
+  metric_bundle(results$actual, results$pred_persistence, results$prob_persistence) %>%
+    mutate(Horizon = paste0(forecast_horizon, "-day"), Model = "Persistence benchmark", Model_Order = 2),
+  metric_bundle(results$actual, results$pred_enet, results$prob_enet) %>%
+    mutate(Horizon = paste0(forecast_horizon, "-day"), Model = "Elastic Net", Model_Order = 3),
+  metric_bundle(results$actual, results$pred_xgb, results$prob_xgb) %>%
+    mutate(Horizon = paste0(forecast_horizon, "-day"), Model = "XGBoost", Model_Order = 4)
+) %>%
+  arrange(Model_Order) %>%
+  select(Horizon, Model, Accuracy, Balanced_Accuracy, Precision, Recall,
+         Specificity, F1, F2, ROC_AUC) 
+
+print(performance_table)
+
+
+# ============================================================
+# 10. CONFUSION TABLE
+# ============================================================
+
+confusion_table <- dplyr::bind_rows(
+  confusion_summary(results$actual, results$pred_majority, "Majority benchmark"),
+  confusion_summary(results$actual, results$pred_persistence, "Persistence benchmark"),
+  confusion_summary(results$actual, results$pred_enet, "Elastic Net"),
+  confusion_summary(results$actual, results$pred_xgb, "XGBoost")
+) %>%
+  mutate(Horizon = paste0(forecast_horizon, "-day")) %>%
+  select(Horizon, Model, TP, TN, FP, FN)
+
+print(confusion_table)
+
+
+# ============================================================
+# 11. CUTOFF SUMMARY
+# ============================================================
+
+cutoff_summary <- tibble::tibble(
+  Horizon = paste0(forecast_horizon, "-day"),
+  Model = c("Elastic Net", "XGBoost"),
+  Mean_Cutoff = c(
+    mean(results$cutoff_enet, na.rm = TRUE),
+    mean(results$cutoff_xgb, na.rm = TRUE)
+  ),
+  Median_Cutoff = c(
+    median(results$cutoff_enet, na.rm = TRUE),
+    median(results$cutoff_xgb, na.rm = TRUE)
+  ),
+  Min_Cutoff = c(
+    min(results$cutoff_enet, na.rm = TRUE),
+    min(results$cutoff_xgb, na.rm = TRUE)
+  ),
+  Max_Cutoff = c(
+    max(results$cutoff_enet, na.rm = TRUE),
+    max(results$cutoff_xgb, na.rm = TRUE)
+  )
+)
+
+print(cutoff_summary)
+
+
+# ============================================================
+# 12. SAVE OUTPUTS
+# ============================================================
+
+readr::write_csv(results, paste0(output_prefix, "_results.csv"))
+readr::write_csv(performance_table, paste0(output_prefix, "_performance.csv"))
+readr::write_csv(confusion_table, paste0(output_prefix, "_confusion.csv"))
+readr::write_csv(cutoff_summary, paste0(output_prefix, "_cutoffs.csv"))
+
+cat("Saved outputs with prefix:", output_prefix, "\n")
+
+
+# ============================================================
+# 13. OPTIONAL PLOTS
+# ============================================================
+
+best_plot_model <- "XGBoost"
+best_prob <- results$prob_xgb
+
+plot_df <- tibble::tibble(
+  date = results$date,
+  actual = results$actual,
+  predicted_probability = best_prob
+)
+
+prob_plot <- ggplot(plot_df, aes(x = date)) +
+  geom_line(aes(y = predicted_probability, colour = "Predicted probability")) +
+  geom_point(aes(y = actual, colour = "Actual stress event"), alpha = 0.6) +
+  labs(
+    title = paste0("Stress-Move Classification: XGBoost (", forecast_horizon, "-Day Horizon)"),
+    x = "Date",
+    y = "Predicted probability / Actual class",
+    colour = ""
+  ) +
+  theme_minimal()
+
+print(prob_plot)
+
+roc_plot <- NULL
+
+try({
+  roc_enet <- pROC::roc(results$actual, results$prob_enet, quiet = TRUE)
+  roc_xgb  <- pROC::roc(results$actual, results$prob_xgb, quiet = TRUE)
+
+  roc_df <- bind_rows(
+    tibble(
+      fpr = 1 - roc_enet$specificities,
+      tpr = roc_enet$sensitivities,
+      model = "Elastic Net"
+    ),
+    tibble(
+      fpr = 1 - roc_xgb$specificities,
+      tpr = roc_xgb$sensitivities,
+      model = "XGBoost"
+    )
+  )
+
+  roc_plot <- ggplot(roc_df, aes(x = fpr, y = tpr, colour = model)) +
+    geom_line(linewidth = 1) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    labs(
+      title = paste0("ROC Curves: Stress-Move Classification (", forecast_horizon, "-Day Horizon)"),
+      x = "False Positive Rate",
+      y = "True Positive Rate",
+      colour = ""
+    ) +
+    theme_minimal()
+
+  print(roc_plot)
+}, silent = TRUE)

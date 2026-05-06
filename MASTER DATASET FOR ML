@@ -1,0 +1,52 @@
+# ============================================================
+# DAILY MASTER DATASET FOR ML
+# Build the daily dataframe used by all ML scripts
+# ============================================================
+
+df <- freight %>%
+  left_join(
+    ais %>%
+      select(
+        date,
+        daily_active_ships,
+        daily_delay_rate,
+        daily_port_arrivals,
+        daily_avg_turnaround_hours
+      ),
+    by = "date"
+  ) %>%
+  left_join(
+    weather %>%
+      select(
+        date,
+        weather_stress_index,
+        joint_storm_dummy
+      ),
+    by = "date"
+  ) %>%
+  left_join(
+    tariff %>%
+      select(
+        date,
+        tariff_rate,
+        goods_tariffed_pct,
+        trade_war
+      ),
+    by = "date"
+  ) %>%
+  left_join(
+    oil %>%
+      select(
+        date,
+        crude_oil_price
+      ),
+    by = "date"
+  ) %>%
+  arrange(date)
+
+# Check result
+glimpse(df)
+colSums(is.na(df))
+
+# Optional export
+write_csv(df, "daily_ml_master_data.csv")

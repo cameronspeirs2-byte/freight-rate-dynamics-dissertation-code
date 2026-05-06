@@ -1,0 +1,543 @@
+# ============================================================
+# DISSERTATION ML SCRIPT: 3-DAY AHEAD FREIGHT FORECASTING
+# ============================================================
+# Purpose:
+# Forecast 3-step-ahead freight returns using:
+# 1. Zero-change benchmark
+# 2. Lag benchmark
+# 3. Elastic Net
+# 4. XGBoost
+#
+# Evaluation:
+# Expanding-window, one forecast at a time
+# ============================================================
+
+
+# ============================================================
+# 0. LIBRARIES
+# ============================================================
+
+library(tidyverse)
+library(lubridate)
+library(zoo)
+library(slider)
+library(glmnet)
+library(xgboost)
+library(fastDummies)
+library(Metrics)
+
+
+# ============================================================
+# 1. SETTINGS
+# ============================================================
+
+forecast_horizon <- 3
+initial_train <- 500
+set.seed(123)
+
+
+# ============================================================
+# 2. PREPARE BASE DATA
+# ============================================================
+
+if (!exists("df")) {
+  stop("df is not available. Build the daily ML master dataset first.")
+}
+
+required_vars <- c(
+  "date",
+  "freight_rate",
+  "daily_delay_rate",
+  "daily_active_ships",
+  "daily_port_arrivals",
+  "daily_avg_turnaround_hours",
+  "weather_stress_index",
+  "joint_storm_dummy",
+  "crude_oil_price",
+  "trade_war",
+  "tariff_rate",
+  "goods_tariffed_pct"
+)
+
+missing_vars <- setdiff(required_vars, names(df))
+if (length(missing_vars) > 0) {
+  stop(paste("Missing required variables in df:", paste(missing_vars, collapse = ", ")))
+}
+
+base_df <- df %>%
+  mutate(
+    date = as.Date(date),
+    crude_oil_price = zoo::na.locf(crude_oil_price, na.rm = FALSE),
+    log_freight = log(freight_rate),
+    d_log_freight = log_freight - lag(log_freight)
+  ) %>%
+  arrange(date)
+# ============================================================
+# 3. THRESHOLDS FOR SHOCK FEATURES
+# ============================================================
+
+threshold_ref <- base_df %>%
+  filter(!is.na(d_log_freight)) %>%
+  slice(1:initial_train)
+
+delay_p90    <- quantile(threshold_ref$daily_delay_rate, 0.90, na.rm = TRUE)
+weather_p90  <- quantile(threshold_ref$weather_stress_index, 0.90, na.rm = TRUE)
+arrivals_p10 <- quantile(threshold_ref$daily_port_arrivals, 0.10, na.rm = TRUE)
+
+threshold_ref <- threshold_ref %>%
+  mutate(d_log_oil_ref = log(crude_oil_price) - log(lag(crude_oil_price)))
+
+oil_abs_p90 <- quantile(abs(threshold_ref$d_log_oil_ref), 0.90, na.rm = TRUE)
+
+
+# ============================================================
+# 4. FEATURE ENGINEERING
+# ============================================================
+
+feature_df <- base_df %>%
+  arrange(date) %>%
+  mutate(
+    # --------------------------------------------------------
+    # TARGET: 3-step-ahead freight return
+    # --------------------------------------------------------
+    target_3d = lead(log_freight, forecast_horizon) - log_freight,
+    
+    # --------------------------------------------------------
+    # Freight dynamics
+    # --------------------------------------------------------
+    lag1_return = lag(d_log_freight, 1),
+    lag3_return = lag(d_log_freight, 3),
+    lag7_return = lag(d_log_freight, 7),
+    
+    roll_mean_3_return = lag(slide_dbl(d_log_freight, mean, .before = 2, .complete = TRUE), 1),
+    roll_mean_7_return = lag(slide_dbl(d_log_freight, mean, .before = 6, .complete = TRUE), 1),
+    roll_sd_7_return   = lag(slide_dbl(d_log_freight, sd,   .before = 6, .complete = TRUE), 1),
+    
+    # --------------------------------------------------------
+    # AIS
+    # --------------------------------------------------------
+    d_delay_rate = daily_delay_rate - lag(daily_delay_rate),
+    d_port_arrivals = daily_port_arrivals - lag(daily_port_arrivals),
+    d_turnaround = daily_avg_turnaround_hours - lag(daily_avg_turnaround_hours),
+    
+    lag1_delay_rate = lag(daily_delay_rate, 1),
+    lag3_delay_rate = lag(daily_delay_rate, 3),
+    lag7_delay_rate = lag(daily_delay_rate, 7),
+    
+    lag1_port_arrivals = lag(daily_port_arrivals, 1),
+    lag7_port_arrivals = lag(daily_port_arrivals, 7),
+    
+    lag1_turnaround = lag(daily_avg_turnaround_hours, 1),
+    lag7_turnaround = lag(daily_avg_turnaround_hours, 7),
+    
+    roll_mean_3_delay_rate = lag(slide_dbl(daily_delay_rate, mean, .before = 2, .complete = TRUE), 1),
+    roll_mean_7_delay_rate = lag(slide_dbl(daily_delay_rate, mean, .before = 6, .complete = TRUE), 1),
+    
+    # --------------------------------------------------------
+    # Weather
+    # --------------------------------------------------------
+    d_weather_stress = weather_stress_index - lag(weather_stress_index),
+    
+    lag1_weather_stress = lag(weather_stress_index, 1),
+    lag3_weather_stress = lag(weather_stress_index, 3),
+    lag7_weather_stress = lag(weather_stress_index, 7),
+    
+    lag1_joint_storm = lag(joint_storm_dummy, 1),
+    lag7_joint_storm = lag(joint_storm_dummy, 7),
+    
+    roll_mean_3_weather_stress = lag(slide_dbl(weather_stress_index, mean, .before = 2, .complete = TRUE), 1),
+    roll_mean_7_weather_stress = lag(slide_dbl(weather_stress_index, mean, .before = 6, .complete = TRUE), 1),
+    
+    # --------------------------------------------------------
+    # Oil
+    # --------------------------------------------------------
+    d_log_oil = log(crude_oil_price) - log(lag(crude_oil_price)),
+    lag1_d_log_oil = lag(d_log_oil, 1),
+    lag3_d_log_oil = lag(d_log_oil, 3),
+    roll_mean_3_d_log_oil = lag(slide_dbl(d_log_oil, mean, .before = 2, .complete = TRUE), 1),
+    
+    # --------------------------------------------------------
+    # Shock / regime indicators
+    # --------------------------------------------------------
+    shock_delay = if_else(daily_delay_rate >= delay_p90, 1L, 0L),
+    shock_weather = if_else(weather_stress_index >= weather_p90, 1L, 0L),
+    shock_oil = if_else(abs(d_log_oil) >= oil_abs_p90, 1L, 0L),
+    low_activity = if_else(daily_port_arrivals <= arrivals_p10, 1L, 0L),
+    
+    # --------------------------------------------------------
+    # Interactions
+    # --------------------------------------------------------
+    weather_x_delay = weather_stress_index * daily_delay_rate,
+    oil_x_delay = d_log_oil * daily_delay_rate,
+    tradewar_x_delay = trade_war * daily_delay_rate,
+    
+    # --------------------------------------------------------
+    # Calendar
+    # --------------------------------------------------------
+    weekday = wday(date, label = TRUE),
+    doy = yday(date),
+    doy_sin = sin(2 * pi * doy / 365.25),
+    doy_cos = cos(2 * pi * doy / 365.25)
+  ) %>%
+  dplyr::select(
+    date,
+    target_3d,
+    
+    # freight
+    lag1_return, lag3_return, lag7_return,
+    roll_mean_3_return, roll_mean_7_return, roll_sd_7_return,
+    
+    # AIS
+    daily_delay_rate, daily_active_ships, daily_port_arrivals, daily_avg_turnaround_hours,
+    d_delay_rate, d_port_arrivals, d_turnaround,
+    lag1_delay_rate, lag3_delay_rate, lag7_delay_rate,
+    lag1_port_arrivals, lag7_port_arrivals,
+    lag1_turnaround, lag7_turnaround,
+    roll_mean_3_delay_rate, roll_mean_7_delay_rate,
+    
+    # weather
+    weather_stress_index, joint_storm_dummy,
+    d_weather_stress,
+    lag1_weather_stress, lag3_weather_stress, lag7_weather_stress,
+    lag1_joint_storm, lag7_joint_storm,
+    roll_mean_3_weather_stress, roll_mean_7_weather_stress,
+    
+    # oil
+    d_log_oil, lag1_d_log_oil, lag3_d_log_oil, roll_mean_3_d_log_oil,
+    
+    # policy
+    trade_war, tariff_rate, goods_tariffed_pct,
+    
+    # shocks / interactions
+    shock_delay, shock_weather, shock_oil, low_activity,
+    weather_x_delay, oil_x_delay, tradewar_x_delay,
+    
+    # calendar
+    weekday, doy_sin, doy_cos
+  ) %>%
+  tidyr::drop_na()
+
+# Dummy weekday
+model_df <- feature_df %>%
+  fastDummies::dummy_cols(
+    select_columns = "weekday",
+    remove_first_dummy = TRUE,
+    remove_selected_columns = TRUE
+  )
+
+cat("Rows in model_df:", nrow(model_df), "\n")
+summary(model_df$target_3d)
+
+
+# ============================================================
+# 5. DEFINE FEATURES
+# ============================================================
+
+target_var <- "target_3d"
+feature_vars <- setdiff(names(model_df), c("date", target_var))
+
+n <- nrow(model_df)
+
+if (n <= initial_train) {
+  stop("Not enough rows after feature engineering.")
+}
+
+# ============================================================
+# 5A. RESTRICTED XGBOOST HYPERPARAMETER TUNING
+# Regression task: select eta and nrounds using initial training sample only
+# ============================================================
+
+# Rationale:
+# - Tuning is restricted to the initial training sample to avoid look-ahead bias.
+# - The final out-of-sample period is not used for hyperparameter selection.
+# - Only eta and nrounds are tuned, as these directly control learning rate
+#   and boosting length while keeping model complexity otherwise fixed.
+
+set.seed(123)
+
+# Use only the initial training window for hyperparameter selection
+tune_data <- model_df[1:initial_train, , drop = FALSE]
+
+# Chronological inner validation split: first 80% train, final 20% validation
+tune_valid_n <- floor(0.20 * nrow(tune_data))
+tune_train_n <- nrow(tune_data) - tune_valid_n
+
+tune_train <- tune_data[1:tune_train_n, , drop = FALSE]
+tune_valid <- tune_data[(tune_train_n + 1):nrow(tune_data), , drop = FALSE]
+
+x_tune_train <- as.matrix(tune_train[, feature_vars, drop = FALSE])
+y_tune_train <- tune_train[[target_var]]
+
+x_tune_valid <- as.matrix(tune_valid[, feature_vars, drop = FALSE])
+y_tune_valid <- tune_valid[[target_var]]
+
+d_tune_train <- xgboost::xgb.DMatrix(
+  data = x_tune_train,
+  label = as.numeric(y_tune_train)
+)
+
+d_tune_valid <- xgboost::xgb.DMatrix(
+  data = x_tune_valid,
+  label = as.numeric(y_tune_valid)
+)
+
+# Restricted grid for eta and nrounds
+xgb_grid <- tidyr::crossing(
+  eta = c(0.02, 0.04, 0.05, 0.06, 0.08),
+  nrounds = c(75L, 100L, 150L, 250L, 350L)
+)
+
+rmse_calc <- function(actual, pred) {
+  sqrt(mean((actual - pred)^2, na.rm = TRUE))
+}
+
+mae_calc <- function(actual, pred) {
+  mean(abs(actual - pred), na.rm = TRUE)
+}
+
+directional_accuracy_calc <- function(actual, pred) {
+  mean(sign(actual) == sign(pred), na.rm = TRUE)
+}
+
+xgb_tuning_results <- purrr::map_dfr(seq_len(nrow(xgb_grid)), function(g) {
+  
+  eta_g <- xgb_grid$eta[g]
+  nrounds_g <- as.integer(xgb_grid$nrounds[g])
+  
+  fit_g <- xgboost::xgb.train(
+    params = list(
+      objective = "reg:squarederror",
+      eval_metric = "rmse",
+      max_depth = 3,
+      eta = eta_g,
+      min_child_weight = 5,
+      subsample = 0.8,
+      colsample_bytree = 0.8,
+      verbosity = 0
+    ),
+    data = d_tune_train,
+    nrounds = nrounds_g
+  )
+  
+  pred_valid_g <- as.numeric(
+    predict(fit_g, newdata = d_tune_valid)
+  )
+  
+  tibble::tibble(
+    horizon = forecast_horizon,
+    eta = eta_g,
+    nrounds = nrounds_g,
+    validation_RMSE = rmse_calc(y_tune_valid, pred_valid_g),
+    validation_MAE = mae_calc(y_tune_valid, pred_valid_g),
+    validation_Directional_Accuracy = directional_accuracy_calc(y_tune_valid, pred_valid_g)
+  )
+})
+
+# Primary tuning criterion: validation RMSE
+# Tie-breakers: MAE, then directional accuracy
+xgb_tuning_results <- xgb_tuning_results %>%
+  dplyr::arrange(
+    validation_RMSE,
+    validation_MAE,
+    dplyr::desc(validation_Directional_Accuracy)
+  )
+
+best_xgb_params <- xgb_tuning_results %>%
+  dplyr::slice(1)
+
+selected_xgb_eta <- best_xgb_params$eta
+selected_xgb_nrounds <- as.integer(best_xgb_params$nrounds)
+
+cat("Selected XGBoost regression parameters for", forecast_horizon, "day horizon:\n")
+cat("eta =", selected_xgb_eta, "\n")
+cat("nrounds =", selected_xgb_nrounds, "\n")
+
+# Save tuning output for reporting and reproducibility
+readr::write_csv(
+  xgb_tuning_results,
+  paste0("xgb_regression_tuning_", forecast_horizon, "day.csv")
+)
+
+readr::write_csv(
+  best_xgb_params,
+  paste0("xgb_regression_best_params_", forecast_horizon, "day.csv")
+)
+
+# ============================================================
+# 6. RESULTS OBJECT
+# ============================================================
+
+results <- tibble(
+  date = model_df$date[(initial_train + 1):n],
+  actual = model_df[[target_var]][(initial_train + 1):n],
+  pred_zero = NA_real_,
+  pred_mean = NA_real_,
+  pred_lag1 = NA_real_,
+  pred_enet = NA_real_,
+  pred_xgb = NA_real_
+)
+
+
+# ============================================================
+# 7. EXPANDING-WINDOW FORECAST LOOP
+# ============================================================
+
+for (i in (initial_train + 1):n) {
+  
+  train_data <- model_df[1:(i - 1), , drop = FALSE]
+  test_data  <- model_df[i, , drop = FALSE]
+  j <- i - initial_train
+  
+  x_train <- as.matrix(train_data[, feature_vars, drop = FALSE])
+  y_train <- train_data[[target_var]]
+  x_test  <- as.matrix(test_data[, feature_vars, drop = FALSE])
+  
+  # ----------------------------------------------------------
+  # Benchmarks
+  # ----------------------------------------------------------
+  results$pred_zero[j] <- 0
+  results$pred_mean[j] <- mean(y_train, na.rm = TRUE)
+  results$pred_lag1[j] <- test_data$lag1_return
+  
+  # ----------------------------------------------------------
+  # Elastic Net
+  # ----------------------------------------------------------
+  enet_fit <- glmnet::cv.glmnet(
+    x = x_train,
+    y = y_train,
+    alpha = 0.5,
+    nfolds = 5
+  )
+  
+  results$pred_enet[j] <- as.numeric(
+    predict(enet_fit, newx = x_test, s = "lambda.min")
+  )
+  
+  # ----------------------------------------------------------
+  # XGBoost
+  # ----------------------------------------------------------
+  dtrain <- xgboost::xgb.DMatrix(
+    data = x_train,
+    label = as.numeric(y_train)
+  )
+  
+  dtest <- xgboost::xgb.DMatrix(
+    data = x_test
+  )
+  
+  xgb_fit <- xgboost::xgb.train(
+    params = list(
+      objective = "reg:squarederror",
+      eval_metric = "rmse",
+      max_depth = 3,
+      eta = selected_xgb_eta,
+      min_child_weight = 5,
+      subsample = 0.8,
+      colsample_bytree = 0.8,
+      verbosity = 0
+    ),
+    data = dtrain,
+    nrounds = selected_xgb_nrounds
+  )
+  
+  results$pred_xgb[j] <- as.numeric(
+    predict(xgb_fit, newdata = dtest)
+  )
+  
+  if (j %% 25 == 0) {
+    cat("Completed forecast", j, "of", n - initial_train, "\n")
+  }
+}
+
+
+# ============================================================
+# 8. PERFORMANCE TABLE
+# ============================================================
+
+model_performance <- tibble(
+  model = c("Zero-change", "Training mean", "Lag-1", "Elastic Net", "XGBoost"),
+  RMSE = c(
+    Metrics::rmse(results$actual, results$pred_zero),
+    Metrics::rmse(results$actual, results$pred_mean),
+    Metrics::rmse(results$actual, results$pred_lag1),
+    Metrics::rmse(results$actual, results$pred_enet),
+    Metrics::rmse(results$actual, results$pred_xgb)
+  ),
+  MAE = c(
+    Metrics::mae(results$actual, results$pred_zero),
+    Metrics::mae(results$actual, results$pred_mean),
+    Metrics::mae(results$actual, results$pred_lag1),
+    Metrics::mae(results$actual, results$pred_enet),
+    Metrics::mae(results$actual, results$pred_xgb)
+  )
+) %>%
+  arrange(RMSE, MAE)
+
+print(model_performance)
+
+
+# ============================================================
+# 9. DIRECTIONAL ACCURACY
+# ============================================================
+
+directional_accuracy <- function(actual, pred) {
+  mean(sign(actual) == sign(pred), na.rm = TRUE)
+}
+
+direction_performance <- tibble(
+  model = c("Zero-change", "Training mean", "Lag-1", "Elastic Net", "XGBoost"),
+  Directional_Accuracy = c(
+    directional_accuracy(results$actual, results$pred_zero),
+    directional_accuracy(results$actual, results$pred_mean),
+    directional_accuracy(results$actual, results$pred_lag1),
+    directional_accuracy(results$actual, results$pred_enet),
+    directional_accuracy(results$actual, results$pred_xgb)
+  )
+)
+
+print(direction_performance)
+
+
+# ============================================================
+# 10. SAVE OUTPUTS
+# ============================================================
+
+write_csv(results, "three_day_forecast_results.csv")
+write_csv(model_performance, "three_day_model_performance.csv")
+write_csv(direction_performance, "three_day_direction_performance.csv")
+
+
+# ============================================================
+# 11. MODEL OUTPUT VISUALISATIONS
+# ============================================================
+
+best_model_name <- model_performance$model[1]
+
+if (best_model_name == "Zero-change") {
+  plot_pred <- results$pred_zero
+} else if (best_model_name == "Training mean") {
+  plot_pred <- results$pred_mean
+} else if (best_model_name == "Lag-1") {
+  plot_pred <- results$pred_lag1
+} else if (best_model_name == "Elastic Net") {
+  plot_pred <- results$pred_enet
+} else {
+  plot_pred <- results$pred_xgb
+}
+
+plot_df <- tibble(
+  date = results$date,
+  actual = results$actual,
+  predicted = plot_pred
+)
+
+ggplot(plot_df, aes(x = date)) +
+  geom_line(aes(y = actual, colour = "Actual")) +
+  geom_line(aes(y = predicted, colour = "Predicted")) +
+  labs(
+    title = paste("Actual vs Predicted 3-Day Freight Return:", best_model_name),
+    x = "Date",
+    y = "3-day freight return",
+    colour = ""
+  ) +
+  theme_minimal()

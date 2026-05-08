@@ -1,0 +1,211 @@
+# ============================================================
+# ERA5 WEATHER FEATURE CREATION FOR SHIPPING DISSERTATION
+# Purpose:
+#   Create daily route-level weather variables from ERA5 wind
+#   and wave NetCDF files for East Asia -> US West Coast lane
+# ============================================================
+
+# ----------------------------
+# 0) Packages
+# ----------------------------
+install_if_missing <- function(pkgs) {
+  to_install <- pkgs[!pkgs %in% installed.packages()[, "Package"]]
+  if (length(to_install) > 0) install.packages(to_install)
+}
+
+install_if_missing(c("terra", "dplyr", "lubridate", "zoo", "readr"))
+
+library(terra)
+library(dplyr)
+library(lubridate)
+library(zoo)
+library(readr)
+
+# ----------------------------
+# 1) Set working directory
+# ----------------------------
+# Change this if needed
+setwd("~/Desktop/Data Science/Disertation")
+
+# ----------------------------
+# 2) File paths
+# ----------------------------
+wind_file <- "wind_raw.nc"
+wave_file <- "wave_raw.nc"
+glimpse(wind_file)
+# ----------------------------
+# 3) Load NetCDF files
+# ----------------------------
+wind <- rast(wind_file)
+wave <- rast(wave_file)
+
+cat("\n--- WIND FILE ---\n")
+print(wind)
+
+cat("\n--- WAVE FILE ---\n")
+print(wave)
+
+cat("\n--- WIND NAMES ---\n")
+print(head(names(wind), 10))
+
+cat("\n--- WAVE NAMES ---\n")
+print(head(names(wave), 10))
+
+# ----------------------------
+# 4) Extract wind variables
+# ----------------------------
+# Wind file should contain u10 and v10
+u10_idx <- grep("^u10_|^u10$", names(wind))
+v10_idx <- grep("^v10_|^v10$", names(wind))
+
+if (length(u10_idx) == 0) stop("Could not find u10 in wind file.")
+if (length(v10_idx) == 0) stop("Could not find v10 in wind file.")
+
+u10 <- wind[[u10_idx]]
+v10 <- wind[[v10_idx]]
+
+# Safety check: same number of layers
+if (nlyr(u10) != nlyr(v10)) {
+  stop("u10 and v10 do not have the same number of layers.")
+}
+
+# ----------------------------
+# 5) Extract wave variable
+# ----------------------------
+# Looking for significant height of combined wind waves and swell
+# ERA5 often stores this as swh
+wave_names <- names(wave)
+
+swh_idx <- grep("^swh_|^swh$", wave_names)
+
+# Fallback in case ERA5 uses a longer name
+if (length(swh_idx) == 0) {
+  swh_idx <- grep("significant.*combined.*waves.*swell|wave", wave_names, ignore.case = TRUE)
+}
+
+if (length(swh_idx) == 0) {
+  stop("Could not find wave-height variable (likely swh) in wave file.")
+}
+
+swh <- wave[[swh_idx]]
+
+# ----------------------------
+# 6) Build wind speed
+# ----------------------------
+wind_speed <- sqrt(u10^2 + v10^2)
+
+# ----------------------------
+# 7) Create timestamps
+# ----------------------------
+extract_unix_time <- function(x) {
+  as.numeric(sub(".*=", "", x))
+}
+
+time_wind <- as.POSIXct(extract_unix_time(names(u10)),
+                        origin = "1970-01-01", tz = "UTC")
+
+time_wave <- as.POSIXct(extract_unix_time(names(swh)),
+                        origin = "1970-01-01", tz = "UTC")
+
+# ----------------------------
+# 8) Route-level extraction (FAST VERSION)
+# ----------------------------
+# WIND
+wind_mean_mat <- global(wind_speed, fun = "mean", na.rm = TRUE)
+wind_max_mat  <- global(wind_speed, fun = "max",  na.rm = TRUE)
+
+# WAVE
+wave_mean_mat <- global(swh, fun = "mean", na.rm = TRUE)
+wave_max_mat  <- global(swh, fun = "max",  na.rm = TRUE)
+
+# ----------------------------
+# 9) Build timestamp-level dataframes
+# ----------------------------
+wind_df <- data.frame(
+  datetime  = time_wind,
+  wind_mean = wind_mean_mat[,1],
+  wind_max  = wind_max_mat[,1]
+)
+
+wave_df <- data.frame(
+  datetime  = time_wave,
+  wave_mean = wave_mean_mat[,1],
+  wave_max  = wave_max_mat[,1]
+)
+
+# ----------------------------
+# 10) Merge wind + wave
+# ----------------------------
+weather_intraday <- dplyr::full_join(wind_df, wave_df, by = "datetime") %>%
+  dplyr::arrange(datetime)
+
+# ----------------------------
+# 11) Create intraday storm indicators
+# ----------------------------
+weather_intraday <- weather_intraday %>%
+  dplyr::mutate(
+    wind_storm = as.integer(wind_max > 15),
+    wave_storm = as.integer(wave_max > 4),
+    joint_storm = as.integer(wind_storm == 1 | wave_storm == 1)
+  )
+
+# ----------------------------
+# 12) Aggregate to daily level
+# ----------------------------
+weather_daily <- weather_intraday %>%
+  dplyr::mutate(date = as.Date(datetime)) %>%
+  dplyr::group_by(date) %>%
+  dplyr::summarise(
+    wind_mean = mean(wind_mean, na.rm = TRUE),
+    wind_max  = max(wind_max, na.rm = TRUE),
+    wave_mean = mean(wave_mean, na.rm = TRUE),
+    wave_max  = max(wave_max, na.rm = TRUE),
+    wind_storm_dummy  = as.integer(max(wind_storm, na.rm = TRUE) > 0),
+    wave_storm_dummy  = as.integer(max(wave_storm, na.rm = TRUE) > 0),
+    joint_storm_dummy = as.integer(max(joint_storm, na.rm = TRUE) > 0),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(date)
+
+# ----------------------------
+# 13) Rolling means and lags
+# ----------------------------
+weather_daily <- weather_daily %>%
+  dplyr::mutate(
+    wind_mean_7d = zoo::rollmean(wind_mean, k = 7, fill = NA, align = "right"),
+    wave_mean_7d = zoo::rollmean(wave_mean, k = 7, fill = NA, align = "right"),
+    wind_max_7d  = zoo::rollapply(wind_max, width = 7, FUN = max, fill = NA, align = "right"),
+    wave_max_7d  = zoo::rollapply(wave_max, width = 7, FUN = max, fill = NA, align = "right"),
+    
+    wind_mean_lag1 = dplyr::lag(wind_mean, 1),
+    wind_mean_lag7 = dplyr::lag(wind_mean, 7),
+    wave_mean_lag1 = dplyr::lag(wave_mean, 1),
+    wave_mean_lag7 = dplyr::lag(wave_mean, 7),
+    joint_storm_lag1 = dplyr::lag(joint_storm_dummy, 1),
+    joint_storm_lag7 = dplyr::lag(joint_storm_dummy, 7)
+  )
+
+# ----------------------------
+# 14) Simple weather stress index
+# ----------------------------
+zscore <- function(x) as.numeric(scale(x))
+
+weather_daily <- weather_daily %>%
+  dplyr::mutate(
+    z_wind_mean = zscore(wind_mean),
+    z_wave_mean = zscore(wave_mean),
+    z_wind_max  = zscore(wind_max),
+    z_wave_max  = zscore(wave_max),
+    weather_stress_index = rowMeans(
+      cbind(z_wind_mean, z_wave_mean, z_wind_max, z_wave_max),
+      na.rm = TRUE
+    )
+  )
+
+# ----------------------------
+# 15) Save
+# ----------------------------
+readr::write_csv(weather_intraday, "weather_intraday_route.csv")
+readr::write_csv(weather_daily, "weather_daily_route.csv")
+
+####################################################################
